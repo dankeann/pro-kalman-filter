@@ -19,3 +19,5 @@ env/
 *.log
 outputs/
 runs/
+venv311/
+trajectories_student.png
