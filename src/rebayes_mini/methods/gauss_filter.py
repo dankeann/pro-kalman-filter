@@ -127,9 +127,9 @@ class ExtendedKalmanFilter:
     def step(self, bel, y, x, callback_fn):
         bel_pred = self._predict(bel)
 
-        Ht = self.jac_obs(bel.mean, x)
+        Ht = self.jac_obs(bel_pred.mean, x)
         Rt = self.observation_covariance
-        yhat = self.vobs_fn(bel.mean, x)
+        yhat = self.vobs_fn(bel_pred.mean, x)
         bel_update = self._update(bel_pred, y, x, yhat, Ht, Rt)
 
         output = callback_fn(bel_update, bel_pred, y, x)

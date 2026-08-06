@@ -150,7 +150,9 @@ class ExtendedKalmanFilterInverseWishart(ExtendedKalmanFilter):
         Ht = self.jac_obs(bel.mean, x)
         I = jnp.eye(len(bel.mean))
         yhat_corr = self.vobs_fn(bel.mean, x)
-        S = (y - yhat_corr) @ (y - yhat_corr).T + Ht @ bel.cov @ Ht.T
+        residual = y - yhat_corr
+        S = jnp.outer(residual, residual) + Ht @ bel.cov @ Ht.T
+        # S = (y - yhat_corr) @ (y - yhat_corr).T + Ht @ bel.cov @ Ht.T
         Lambda = (self.noise_scaling * self.observation_covariance + S) / (self.noise_scaling + 1)
 
         Kt = jnp.linalg.solve(Ht @ bel_pred.cov @ Ht.T + Lambda, Ht @ bel_pred.cov)
@@ -404,10 +406,10 @@ class ExtendedKalmanFilterIMQ(ExtendedKalmanFilter):
     def step(self, bel, y, x, callback_fn):
         bel_pred = self._predict(bel)
 
-        yhat = self.vobs_fn(bel.mean, x)
+        yhat = self.vobs_fn(bel_pred.mean, x)
         err = y - yhat
         weighting_term = self.soft_threshold ** 2 / (self.soft_threshold ** 2 + jnp.inner(err, err))
-        Ht = self.jac_obs(bel.mean, x)
+        Ht = self.jac_obs(bel_pred.mean, x)
         Rt = self.observation_covariance / weighting_term
 
         bel_update = self._update(bel_pred, y, x, yhat, Ht, Rt)
@@ -427,7 +429,7 @@ class BeliefExtendedKalmanFilterIMQ(BeliefExtendedKalmanFilter):
         bel_pred = self._predict(bel)
 
         yhat = self.vobs_fn(bel_pred.mean, x, bel_pred)
-        Ht = self.jac_obs(bel_pred.mean, x, bel)
+        Ht = self.jac_obs(bel_pred.mean, x, bel_pred)
         err = y - yhat
         weighting_term = self.soft_threshold ** 2 / (self.soft_threshold ** 2 + jnp.inner(err, err))
         Rt = self.observation_covariance / weighting_term
@@ -461,8 +463,8 @@ class ExtendedKalmanFilterBernoulli(ExtendedKalmanFilter):
         return OutlierEKFState(
             mean=mean,
             cov=cov,
-            alpha=1.0,
-            beta=1.0,
+            alpha=self.alpha0,
+            beta=self.beta0,
             pr_inlier=1.0,
             tau=0.0,
         )
@@ -471,8 +473,8 @@ class ExtendedKalmanFilterBernoulli(ExtendedKalmanFilter):
         """
         Expectation for pi --- density for the outlier probablity
         """
-        elog_pr = digamma(bel.alpha) - digamma(bel.alpha + bel.beta + 1) # (29)
-        elog_1mpr = digamma(bel.beta + 1) - digamma(bel.alpha + bel.beta + 1) # (30)
+        elog_pr = digamma(bel.alpha) - digamma(bel.alpha + bel.beta) # (29)
+        elog_1mpr = digamma(bel.beta) - digamma(bel.alpha + bel.beta) # (30)
         return elog_pr, elog_1mpr
 
     def _update_expectation_inlier(self, bel, bel_pred, y, x):
@@ -513,33 +515,68 @@ class ExtendedKalmanFilterBernoulli(ExtendedKalmanFilter):
         bel = bel.replace(mean=mean_update, cov=cov_update)
         return bel
 
-    def _inner_update(self, i, bel, bel_pred, y, x):
-        e_inlier = bel.pr_inlier
-        # update posterior mean and covariance
-        # with (18, 19) or (24, 25)
-        mean_old = bel.mean
+    def _inner_update(self, _, bel_iter, bel_pred, y, x):
+        """
+        One coordinate-ascent iteration:
 
-        bel = jax.lax.cond(
-            self._is_outlier(e_inlier),
+            1. update q(x_t) using the current E[z_t];
+            2. update q(z_t) using the new q(x_t);
+            3. update q(pi_t).
+
+        bel_pred remains the fixed predictive distribution throughout.
+        """
+        mean_old = bel_iter.mean
+        pr_inlier_old = bel_iter.pr_inlier
+
+        # Update q(x_t) from the fixed predictive distribution using
+        # the current value of E[z_t].
+        bel_state = jax.lax.cond(
+            self._is_outlier(pr_inlier_old),
             lambda: self._update_with_outlier(bel_pred),
-            lambda: self._update_with_inlier(bel_pred, y, x, e_inlier)
+            lambda: self._update_with_inlier(
+                bel_pred,
+                y,
+                x,
+                pr_inlier_old,
+            ),
         )
 
-        expectation_inlier = self._update_expectation_inlier(bel, bel_pred, y, x) # (31)
-        alpha_new = self.alpha0 + expectation_inlier
-        beta_new = self.beta0 + 1 - expectation_inlier
+        # Preserve the current local beta parameters. The state update
+        # starts from bel_pred, whose auxiliary fields may come from
+        # the previous time step.
+        bel_state = bel_state.replace(
+            alpha=bel_iter.alpha,
+            beta=bel_iter.beta,
+            pr_inlier=pr_inlier_old,
+        )
 
+        # Update q(z_t) from the newly updated q(x_t).
+        pr_inlier_new = self._update_expectation_inlier(
+            bel_state,
+            bel_pred,
+            y,
+            x,
+        )
 
-        tau = jnp.linalg.norm(bel.mean - mean_old) / jnp.linalg.norm(mean_old)
-        bel = bel.replace(
-            pr_inlier=expectation_inlier,
+        # Update q(pi_t).
+        alpha_new = self.alpha0 + pr_inlier_new
+        beta_new = self.beta0 + 1.0 - pr_inlier_new
+
+        denominator = jnp.maximum(
+            jnp.linalg.norm(mean_old),
+            1e-12,
+        )
+        tau = (
+            jnp.linalg.norm(bel_state.mean - mean_old)
+            / denominator
+        )
+
+        return bel_state.replace(
+            pr_inlier=pr_inlier_new,
             alpha=alpha_new,
             beta=beta_new,
             tau=tau,
         )
-
-        return bel
-
 
     def _compute_B_term(self, bel, bel_pred, y, x):
         """
@@ -549,18 +586,40 @@ class ExtendedKalmanFilterBernoulli(ExtendedKalmanFilter):
         ht = self.vobs_fn(bel_pred.mean, x)
         yhat_c = ht + Ht @ (bel.mean - bel_pred.mean)
         err = y - yhat_c
-        B = jnp.outer(err, err) # + Ht @ bel.cov @ Ht.T
+        B = jnp.outer(err, err) + Ht @ bel.cov @ Ht.T
         return B
 
     def step(self, bel, y, x, callback_fn):
         bel_pred = self._predict(bel)
-        bel = bel_pred.replace(pr_inlier=1.0, tau=1.0)
-        _inner = partial(self._inner_update, bel_pred=bel_pred, y=y, x=x)
-        bel_update = jax.lax.fori_loop(0, self.n_inner, _inner, bel)
-        # i = 0
-        # bel_update, i = jax.lax.while_loop(lambda xs: xs[0].tau > self.tol_inner, _inner, (bel, i))
 
-        output = callback_fn(bel_update, bel_pred, y, x)
+        # pi_t and z_t are local to the current time step.
+        bel_iter = bel_pred.replace(
+            alpha=self.alpha0,
+            beta=self.beta0,
+            pr_inlier=1.0,
+            tau=1.0,
+        )
+
+        inner_update = partial(
+            self._inner_update,
+            bel_pred=bel_pred,
+            y=y,
+            x=x,
+        )
+
+        bel_update = jax.lax.fori_loop(
+            0,
+            self.n_inner,
+            inner_update,
+            bel_iter,
+        )
+
+        output = callback_fn(
+            bel_update,
+            bel_pred,
+            y,
+            x,
+        )
         return bel_update, output
 
 
