@@ -375,3 +375,4 @@ class IteratedPrOFilter(ExtendedKalmanFilter):
         bel_update = bel.replace(mean=mean_new, cov=cov_new)
         output = callback_fn(bel_update, bel_pred, y, x)
         return bel_update, output
+

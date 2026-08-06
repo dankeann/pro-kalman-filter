@@ -134,6 +134,51 @@ class GaussStMovingObject2D(MovingObject2D):
 
         return z_next, output
 
+class ManeuveringGaussSt2D(MovingObject2D):
+    def __init__(self, sampling_period, dynamics_covariance, observation_covariance, B, transition_prob, dof_observed):
+        super().__init__(sampling_period, dynamics_covariance, observation_covariance)
+        self.B = B
+        T = jnp.ones((B.shape[1], B.shape[1])) * 0.5 * (1-transition_prob)
+        T = T.at[jnp.diag_indices_from(T)].set(transition_prob)
+        self.transition_state = T
+        self.dof_observed = dof_observed
+
+    def sample_multivariate_t(self, key, mean, covariance, df):
+        key_gamma, key_norm = jax.random.split(key)
+        dim = len(mean)
+        zeros = jnp.zeros(dim)
+        err = jax.random.multivariate_normal(key_norm, mean=zeros, cov=covariance)
+        shape, rate = df / 2, df / 2
+        w  = jax.random.gamma(key_gamma, shape=(1,), a=shape) / rate
+
+        x = mean + err / jnp.sqrt(w)
+        return x
+
+    def step(self, z_prev, key):
+        z_prev, regime_prev = z_prev
+        key_regime, key_latent, key_obs = jax.random.split(key, 3)
+        probabilities = self.transition_state[regime_prev, :]
+        logits = jnp.log(probabilities)
+        regime_next = jax.random.categorical(key_regime, logits)
+        
+        mean_next = self.transition_matrix @ z_prev + self.B[:, regime_next]
+        z_next = jax.random.multivariate_normal(key_latent, mean_next, self.dynamics_covariance)
+        
+        obs_next = self.sample_multivariate_t(
+            key_obs,
+            mean=self.projection_matrix @ z_next,
+            covariance=self.observation_covariance,
+            df=self.dof_observed,
+        )
+
+        z_next = (z_next, regime_next)
+        output = {
+            "observed": obs_next,
+            "latent": z_next,
+        }
+
+        return z_next, output
+
 class GaussStMovingObject2D_dynamic(MovingObject2D):
     def __init__(
         self, sampling_period, dynamics_covariance, observation_covariance,
