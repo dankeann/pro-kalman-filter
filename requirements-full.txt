@@ -110,7 +110,6 @@ python-json-logger==4.0.0
 pytz==2025.2
 PyYAML==6.0.3
 pyzmq==27.1.0
--e git+https://github.com/dankeann/pro-kalman-filter.git@b4ebc0bc75c650d08fcfe6af0d0a442730ec9fb6#egg=rebayes_mini&subdirectory=src
 referencing==0.37.0
 requests==2.32.5
 rfc3339-validator==0.1.4
