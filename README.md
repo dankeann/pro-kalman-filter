@@ -1,8 +1,8 @@
-# Predictively oriented Kalman filtering
+# An Unscented PrO Kalman Filter
 
 This repository contains the code and instructions needed to reproduce the experiments for:
 
-Predictively oriented Kalman filtering, Zheyang Shen, Gerardo Duran-Martin, and Chris J Oates. 
+An Unscented PrO Kalman Filter, Dan Kean, Zheyang Shen, and Chris J Oates.
 
 ## Repository structure
 ```text
@@ -22,10 +22,8 @@ python -m pip install -e .
 ```
 
 ## Experiments
-The code to reproduce predictively oriented KF for linear and nonlinear filters can be found in the attached jupyter notebooks.
+The code to reproduce the unscented and cubature PrO Kalman filters (UKF-PrO, CKF-PrO, UKF-PrO+ and CKF-PrO+) on the Lorenz96 experiments can be found in the attached jupyter notebooks.
 
 ## Contact
 
-Zheyang Shen: [email](mailto:zheyangshen@gmail.com)
-
-::: 
+Dan Kean: [email](mailto:c3039565@newcastle.ac.uk)
