@@ -521,7 +521,7 @@ class UKFPrOFilterPred(UnscentedKalmanFilter):
 
 
 # Methods Copy and Pasted from profilter.py - IteratedPrOFilter
-class IteratedUKFPrOFilter(UnscentedKalmanFilter):
+class IteratedUKFPrOFilter(UnscentedKalmanFilter): # This is unused in the UKF-PrO paper
     def __init__(
         self, fn_latent, fn_obs, dynamics_covariance, observation_covariance, n_inner, n_outer,
     ):
@@ -1080,6 +1080,9 @@ class CKFPrOFilterPred(CubatureKalmanFilter):
 
 
 class UKFPrOFilter(UnscentedKalmanFilter):
+    # Sigma-point settings used in the UPDATE step (eqs. 13-14)
+    UPDATE_ALPHA, UPDATE_BETA, UPDATE_KAPPA = 1e-3, 2.0, 0.0
+ 
     def __init__(
         self,
         fn_latent,
@@ -1106,43 +1109,44 @@ class UKFPrOFilter(UnscentedKalmanFilter):
         self.inner_step_tol = inner_step_tol
         self.inner_obj_tol = inner_obj_tol
         self.lbfgs_memory_size = lbfgs_memory_size
-
+ 
     def step(self, bel, y, x, callback_fn):
-        bel_pred = super()._predict(bel)
-
+        bel_pred = self._predict(bel)
+ 
         a = bel_pred.mean
         A = bel_pred.cov
         L_pred = jnp.linalg.cholesky(A)
         d = a.shape[0]
         R = self.observation_covariance
-
+ 
         def obs_fn_h(z):
             return self.vobs_fn(z, x)
-
+ 
         active_mask = jnp.tril(jnp.ones_like(A))
         n_active = jnp.sum(active_mask) + d
-
+ 
         def active_rms(m_vec, U_mat):
             sq = jnp.sum(jnp.square(m_vec)) + jnp.sum(jnp.square(U_mat * active_mask))
             return jnp.sqrt(sq / n_active)
-
+ 
         def kl_term(m, P):
             diff = m - a
             L_diff = jsp_linalg.solve_triangular(L_pred, diff, lower=True)
             mean_term = jnp.sum(jnp.square(L_diff))
-
+ 
             L_P_white = jsp_linalg.solve_triangular(L_pred, P, lower=True)
             L_P_white = jsp_linalg.solve_triangular(L_pred, L_P_white.T, lower=True).T
             trace_term = jnp.trace(L_P_white)
-
+ 
             _, logdet_P = jnp.linalg.slogdet(P)
             logdet_A = 2.0 * jnp.sum(jnp.log(jnp.diagonal(L_pred)))
-
+ 
             # Constant "-d" term dropped, matching PrOFilter's convention (=+C)
             return 0.5 * (trace_term + mean_term + logdet_A - logdet_P)
-
+ 
         def nll_term(m, P):
-            mu, Sigma_raw = unscented_transform(m, P, obs_fn_h)
+            mu, Sigma_raw = unscented_transform(m, P, obs_fn_h, alpha=self.UPDATE_ALPHA,
+                                                beta=self.UPDATE_BETA, kappa=self.UPDATE_KAPPA)
             Sigma = Sigma_raw + R
             diff = y - mu
             L_Sigma = jnp.linalg.cholesky(Sigma)
@@ -1151,28 +1155,28 @@ class UKFPrOFilter(UnscentedKalmanFilter):
             logdet_Sigma = 2.0 * jnp.sum(jnp.log(jnp.diagonal(L_Sigma)))
             # Constant "+ dim_y * log(2*pi)" term dropped, matching PrOFilter's convention
             return 0.5 * (quad + logdet_Sigma)
-
+ 
         def obj_func(params):
             m_free, U = params
             B = chol_softplus(U)
             L_candidate = L_pred @ B
             P_candidate = L_candidate @ L_candidate.T
             return kl_term(m_free, P_candidate) + nll_term(m_free, P_candidate)
-
+ 
         value_and_grad_fn = jax.value_and_grad(obj_func)
-
+ 
         def value_fn(p):
             return obj_func(p)
-
+ 
         solver = optax.lbfgs(memory_size=self.lbfgs_memory_size, scale_init_precond=True)
         params_init = (a, jnp.zeros_like(A))
         solver_state = solver.init(params_init)
         value_init, grad_init = value_and_grad_fn(params_init)
-
+ 
         init_carry = (params_init, solver_state, jnp.asarray(0), value_init, grad_init, params_init, value_init)
-
+ 
         total_iters = self.n_inner * self.n_outer
-
+ 
         def cond_fn(carry):
             params_c, state_c, count, value_c, grad_c, params_prev, value_prev = carry
             grad_norm = active_rms(grad_c[0], grad_c[1])
@@ -1185,7 +1189,7 @@ class UKFPrOFilter(UnscentedKalmanFilter):
             )
             finite = jnp.isfinite(value_c) & jnp.isfinite(grad_norm)
             return (count < total_iters) & (~converged) & finite
-
+ 
         def body_fn(carry):
             params_c, state_c, count, value_c, grad_c, params_prev, value_prev = carry
             updates, state_new = solver.update(
@@ -1194,34 +1198,32 @@ class UKFPrOFilter(UnscentedKalmanFilter):
             params_new = optax.apply_updates(params_c, updates)
             value_new, grad_new = value_and_grad_fn(params_new)
             return (params_new, state_new, count + 1, value_new, grad_new, params_c, value_c)
-
+ 
         final = jax.lax.while_loop(cond_fn, body_fn, init_carry)
         m_new, U_new = final[0]
-
+ 
         B_new = chol_softplus(U_new)
         L_new = L_pred @ B_new
         cov_new = L_new @ L_new.T
-
+ 
         bel_update = bel_pred.replace(mean=m_new, cov=cov_new)
         output = callback_fn(bel_update, bel_pred, y, x)
         return bel_update, output
-
-
-import jax
-import jax.numpy as jnp
-import jax.scipy.linalg as jsp_linalg
-import optax
-from profilter import chol_softplus
-from unscented import UnscentedKalmanFilter
+ 
+ 
+class CKFPrOFilter(UKFPrOFilter):
+    """CKF-PrO+: cubature rule (alpha=1, beta=0, kappa=0) in both the predict and update steps."""
+    UPDATE_ALPHA, UPDATE_BETA, UPDATE_KAPPA = 1.0, 0.0, 0.0
+ 
+    def _predict(self, bel):
+        return CubatureKalmanFilter._predict(self, bel)
 
 
 class UKFPrOFilterTaylor(UnscentedKalmanFilter):
     """
-    Implements Zheyang's Taylor-expansion approximation: sigma points and
-    Jacobians of h are computed once per OUTER iteration, at the current
+    sigma points and Jacobians of h are computed once per outer iteration, at the current
     (m_lin, P_lin). The INNER loop searches over candidate (m', P') using
-    a first-order Taylor approximation of how the sigma points' images
-    under h would change, avoiding repeated evaluation/autodiff of h.
+    a first-order Taylor approximation
     """
 
     def __init__(
